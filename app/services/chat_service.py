@@ -1,244 +1,142 @@
+import os
+import warnings
+warnings.filterwarnings("ignore", message="Relevance scores must be between 0 and 1")
+from langchain_core.output_parsers import StrOutputParser
+
 from app.llm.model import get_llm
-from app.llm.prompts import assistant_prompt
+from app.llm.prompts import (
+    NOT_FOUND_MESSAGE,
+    assistant_prompt,
+    rewrite_prompt,
+)
+from app.memory.chat_memory import get_history, recent_messages
 from app.rag.vectorstore import create_vector_store
-from app.memory.chat_memory import chat_history
+
+TOP_K = 6
+
+# Relevance is 0..1 (higher = better). Chunks below this are ignored.
+# Tune it: print the scores for good and bad questions and pick a cut-off.
+MIN_RELEVANCE = 0.3
+
 
 class ChatService:
 
     def __init__(self):
-
-        # ==============================
-        # Load LLM
-        # ==============================
-
         print("Loading LLM...")
-
         self.llm = get_llm()
 
-        # ==============================
-        # Load vector database
-        # ==============================
-
         print("Loading vector database...")
-
         self.vectorstore = create_vector_store()
 
-        # ==============================
-        # Create LLM chain
-        # ==============================
+        self.answer_chain = assistant_prompt | self.llm | StrOutputParser()
+        self.rewrite_chain = rewrite_prompt | self.llm | StrOutputParser()
 
-        self.chain = assistant_prompt | self.llm
+    # ---------------------------------
+    # Turn "how much does it cost?" into a standalone question
+    # ---------------------------------
 
+    def standalone_question(self, question, history):
+        if not history:
+            return question
 
-    # =================================
-    # Extract sources from answer
-    # =================================
+        rewritten = self.rewrite_chain.invoke(
+            {"question": question, "chat_history": history}
+        ).strip()
 
-    def extract_sources(self, answer):
+        return rewritten or question
 
-        sources = []
+    # ---------------------------------
+    # Retrieve relevant chunks
+    # ---------------------------------
 
-        seen = set()
-
-        if "Sources:" not in answer:
-            return sources
-
-        source_section = answer.split(
-            "Sources:",
-            1
-        )[1]
-
-        for line in source_section.splitlines():
-
-            line = line.strip()
-
-            if not line.startswith("-"):
-                continue
-
-            line = line.lstrip("-").strip()
-
-            parts = line.rsplit(
-                ", Page ",
-                1
-            )
-
-            if len(parts) != 2:
-                continue
-
-            filename = parts[0].strip()
-
-            try:
-                page = int(parts[1].strip())
-            except ValueError:
-                continue
-
-            key = (
-                filename,
-                page
-            )
-
-            if key not in seen:
-
-                seen.add(key)
-
-                sources.append(
-                    {
-                        "file": filename,
-                        "page": page
-                    }
-                )
-
-        return sources
-
-
-    # =================================
-    # Chat
-    # =================================
-
-    def chat(self, question):
-
-        question = question.strip()
-
-        # ==============================
-        # Validate question
-        # ==============================
-
-        if not question:
-
-            return {
-                "answer": "Please provide a question.",
-                "sources": []
-            }
-
-
-        # ==============================
-        # Retrieve documents
-        # ==============================
-
-        results = (
-            self.vectorstore
-            .similarity_search_with_score(
-                question,
-                k=8
-            )
+    def retrieve(self, query):
+        results = self.vectorstore.similarity_search_with_relevance_scores(
+            query,
+            k=TOP_K,
         )
 
+        print(f"\nSearch: {query}")
+        for doc, score in results:
+            file = os.path.basename(doc.metadata.get("source", ""))
+            print(f"  {score:.3f}  {file} page {doc.metadata.get('page')}")
 
-        # ==============================
-        # No results
-        # ==============================
+        return [
+            (doc, score)
+            for doc, score in results
+            if score >= MIN_RELEVANCE
+        ]
+    # ---------------------------------
+    # Build the context and the sources list from metadata
+    # ---------------------------------
 
-        if not results:
-
-            answer = (
-                "I could not find this information "
-                "in the provided documents."
-            )
-
-            return {
-                "answer": answer,
-                "sources": []
-            }
-
-
-        # ==============================
-        # Build context
-        # ==============================
-
+    @staticmethod
+    def build_context(results):
         context_parts = []
-
+        sources = {}
 
         for doc, score in results:
-
-            source = doc.metadata.get(
-                "source",
-                "unknown"
-            )
-
-            page = doc.metadata.get(
-                "page",
-                None
-            )
-
-
-            if page is not None:
-
-                page_display = page + 1
-
-            else:
-
-                page_display = "unknown"
-
+            file = os.path.basename(doc.metadata.get("source", "unknown"))
+            page = doc.metadata.get("page")
+            page_display = page + 1 if page is not None else None
 
             context_parts.append(
-                f"""
-Source: {source}
-Page: {page_display}
-
-Content:
-{doc.page_content}
-"""
+                f"Source: {file}, Page {page_display}\n{doc.page_content}"
             )
 
+            key = (file, page_display)
+            if key not in sources or score > sources[key]["score"]:
+                sources[key] = {
+                    "file": file,
+                    "page": page_display,
+                    "score": round(score, 3),
+                }
 
-        context = "\n\n".join(
-            context_parts
+        sorted_sources = sorted(
+            sources.values(),
+            key=lambda s: s["score"],
+            reverse=True,
         )
 
+        return "\n\n---\n\n".join(context_parts), sorted_sources
 
-        # ==============================
-        # Generate answer
-        # ==============================
+    # ---------------------------------
+    # Chat
+    # ---------------------------------
 
-        response = self.chain.invoke(
-            {
-                "question": question,
-                "context": context,
-                "chat_history": chat_history.messages
-            }
-        )
+    def chat(self, question, session_id):
+        question = question.strip()
 
+        if not question:
+            return {"answer": "Please provide a question.", "sources": []}
 
-        answer = response.content
+        history = recent_messages(session_id)
 
+        search_query = self.standalone_question(question, history)
+        results = self.retrieve(search_query)
 
-        # ==============================
-        # Determine sources
-        # ==============================
-
-        if (
-            "I could not find this information "
-            "in the provided documents."
-            in answer
-        ):
-
+        if not results:
+            answer = NOT_FOUND_MESSAGE
             sources = []
-
         else:
+            context, sources = self.build_context(results)
 
-            sources = self.extract_sources(
-                answer
-            )
+            answer = self.answer_chain.invoke(
+                {
+                    "question": question,
+                    "context": context,
+                    "chat_history": history,
+                }
+            ).strip()
 
+            if NOT_FOUND_MESSAGE in answer:
+                sources = []
 
-        # ==============================
-        # Save conversation
-        # ==============================
-
-        chat_history.add_user_message(
-            question
-        )
-
-        chat_history.add_ai_message(
-            answer
-        )
-
-
-        # ==============================
-        # Return response
-        # ==============================
+        session = get_history(session_id)
+        session.add_user_message(question)
+        session.add_ai_message(answer)
 
         return {
             "answer": answer,
-            "sources": sources
+            "sources": sources,
+            "search_query": search_query,
         }
