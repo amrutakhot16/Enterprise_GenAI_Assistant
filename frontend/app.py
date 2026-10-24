@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-
+import uuid
 # =====================================
 # Configuration
 # =====================================
@@ -28,6 +28,25 @@ if "messages" not in st.session_state:
 
     st.session_state.messages = []
 
+# Each browser tab gets its own conversation on the backend
+if "session_id" not in st.session_state:
+
+    st.session_state.session_id = str(uuid.uuid4())
+
+
+if st.sidebar.button("New chat"):
+
+    try:
+        requests.delete(
+            f"{API_URL}/{st.session_state.session_id}",
+            timeout=10
+        )
+    except requests.exceptions.RequestException:
+        pass
+
+    st.session_state.messages = []
+    st.session_state.session_id = str(uuid.uuid4())
+    st.rerun()
 
 # =====================================
 # Display previous messages
@@ -94,8 +113,9 @@ if question:
 
         response = requests.post(
             API_URL,
-            json={
-                "question": question
+                        json={
+                "question": question,
+                "session_id": st.session_state.session_id
             },
             timeout=120
         )
@@ -181,24 +201,6 @@ if question:
         "sources",
         []
     )
-
-
-    # ---------------------------------
-    # Remove Sources section from answer
-    # ---------------------------------
-    #
-    # The backend already returns sources
-    # separately, so we don't want to show
-    # the Sources section twice.
-    #
-
-    if "Sources:" in answer:
-
-        answer = answer.split(
-            "Sources:",
-            1
-        )[0].strip()
-
 
     # ---------------------------------
     # Display assistant response
