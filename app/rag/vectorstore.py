@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import threading
 
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
@@ -10,6 +11,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 DOCUMENTS_PATH = "documents"
 VECTORSTORE_PATH = "vectorstore"
 MANIFEST_PATH = os.path.join(VECTORSTORE_PATH, "manifest.json")
+MAX_UPLOAD_MB = 20
+
+# Stops two uploads from writing the manifest at the same time
+_index_lock = threading.Lock()
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=1200,
@@ -84,6 +89,53 @@ def sync_documents(vectorstore):
         print(f"Removed {path} from index")
 
     _save_manifest(current)
+
+
+# ---------------------------------
+# Uploads
+# ---------------------------------
+
+def list_documents():
+    return sorted(
+        name
+        for name in os.listdir(DOCUMENTS_PATH)
+        if name.lower().endswith(".pdf")
+    )
+
+
+def save_and_index(vectorstore, filename, data):
+    """Save an uploaded PDF into documents/ and index it right away."""
+
+    name = os.path.basename(filename or "")
+
+    if not name.lower().endswith(".pdf"):
+        raise ValueError("Only PDF files are supported.")
+
+    if not data.startswith(b"%PDF"):
+        raise ValueError("This file is not a valid PDF.")
+
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"PDF is larger than {MAX_UPLOAD_MB} MB.")
+
+    path = os.path.join(DOCUMENTS_PATH, name)
+
+    with open(path, "wb") as f:
+        f.write(data)
+
+    with _index_lock:
+        try:
+            chunks = index_file(vectorstore, path)
+        except Exception:
+            os.remove(path)
+            raise ValueError("Could not read this PDF.")
+
+        manifest = _load_manifest()
+        manifest[path] = _fingerprint(path)
+        _save_manifest(manifest)
+
+    print(f"Uploaded and indexed {path}: {chunks} chunks")
+
+    return {"file": name, "chunks": chunks}
 
 
 def create_vector_store():
