@@ -1,6 +1,6 @@
 import os
 import warnings
-warnings.filterwarnings("ignore", message="Relevance scores must be between 0 and 1")
+
 from langchain_core.output_parsers import StrOutputParser
 
 from app.llm.model import get_llm
@@ -11,6 +11,8 @@ from app.llm.prompts import (
 )
 from app.memory.chat_memory import get_history, recent_messages
 from app.rag.vectorstore import create_vector_store
+
+warnings.filterwarnings("ignore", message="Relevance scores must be between 0 and 1")
 
 TOP_K = 6
 
@@ -65,6 +67,7 @@ class ChatService:
             for doc, score in results
             if score >= MIN_RELEVANCE
         ]
+
     # ---------------------------------
     # Build the context and the sources list from metadata
     # ---------------------------------
@@ -100,43 +103,75 @@ class ChatService:
         return "\n\n---\n\n".join(context_parts), sorted_sources
 
     # ---------------------------------
-    # Chat
+    # Streaming chat: yields events one by one
+    #   {"type": "token", "text": "..."}   a piece of the answer
+    #   {"type": "done", "sources": [...]} sent once at the end
     # ---------------------------------
 
-    def chat(self, question, session_id):
+    def stream_chat(self, question, session_id):
         question = question.strip()
 
         if not question:
-            return {"answer": "Please provide a question.", "sources": []}
+            yield {"type": "token", "text": "Please provide a question."}
+            yield {"type": "done", "sources": [], "search_query": ""}
+            return
 
         history = recent_messages(session_id)
 
         search_query = self.standalone_question(question, history)
         results = self.retrieve(search_query)
 
+        answer_parts = []
+        sources = []
+
         if not results:
-            answer = NOT_FOUND_MESSAGE
-            sources = []
+            answer_parts.append(NOT_FOUND_MESSAGE)
+            yield {"type": "token", "text": NOT_FOUND_MESSAGE}
         else:
             context, sources = self.build_context(results)
 
-            answer = self.answer_chain.invoke(
+            for piece in self.answer_chain.stream(
                 {
                     "question": question,
                     "context": context,
                     "chat_history": history,
                 }
-            ).strip()
+            ):
+                if piece:
+                    answer_parts.append(piece)
+                    yield {"type": "token", "text": piece}
 
-            if NOT_FOUND_MESSAGE in answer:
-                sources = []
+        answer = "".join(answer_parts).strip()
+
+        if NOT_FOUND_MESSAGE in answer:
+            sources = []
 
         session = get_history(session_id)
         session.add_user_message(question)
         session.add_ai_message(answer)
 
-        return {
-            "answer": answer,
+        yield {
+            "type": "done",
             "sources": sources,
             "search_query": search_query,
+        }
+
+    # ---------------------------------
+    # Non-streaming chat (same logic, collected into one response)
+    # ---------------------------------
+
+    def chat(self, question, session_id):
+        answer_parts = []
+        final = {}
+
+        for event in self.stream_chat(question, session_id):
+            if event["type"] == "token":
+                answer_parts.append(event["text"])
+            else:
+                final = event
+
+        return {
+            "answer": "".join(answer_parts).strip(),
+            "sources": final.get("sources", []),
+            "search_query": final.get("search_query", ""),
         }
